@@ -1,0 +1,73 @@
+name: Publish
+
+# `mise publish <version> <message>` pushes the release commit to `test`. Here it
+# is tested; only a green run fast-forwards `main` to it, tags v<version> and
+# creates the GitHub release. A red run leaves `main` untouched.
+on:
+    push:
+        branches:
+            - test
+
+permissions:
+    contents: write
+
+concurrency:
+    group: publish
+    cancel-in-progress: false
+
+jobs:
+    publish:
+        name: Test, fast-forward main, release
+        runs-on: ubuntu-26.04
+        steps:
+            # Pushing through the deploy key, not GITHUB_TOKEN: GitHub refuses a
+            # GITHUB_TOKEN push that brings changes to .github/workflows/.
+            - name: Checkout test branch
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  fetch-depth: 0
+                  ref: test
+                  ssh-key: ${{ secrets.RELEASE_SSH_KEY }}
+
+            - name: Resolve version
+              id: version
+              run: |
+                  version="$(tr -d '[:space:]' < VERSION)"
+                  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::VERSION must hold one version like 0.2.0, got '${version}'"; exit 1; }
+                  echo "version=${version}" >> "$GITHUB_OUTPUT"
+                  echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+
+            - name: Ensure release tag is new
+              run: |
+                  if git ls-remote --exit-code --tags origin "refs/tags/${{ steps.version.outputs.tag }}"; then
+                    echo "::error::Tag ${{ steps.version.outputs.tag }} already exists. Bump the version before publishing."
+                    exit 1
+                  fi
+
+            - name: Install mise
+              uses: jdx/mise-action@82a612c5ab8bcda7cc5db6b7e81a8e7584c3dc6e # v5.2.3
+              with:
+                  version: 2026.10.18
+
+            - name: Test
+              run: mise test
+
+            # Fast-forward only: if main moved on its own, the push is rejected
+            # instead of silently dropping those commits.
+            - name: Push main and tag
+              run: |
+                  git remote set-url origin "git@github.com:${GITHUB_REPOSITORY}.git"
+                  git push origin HEAD:main
+                  git tag "${{ steps.version.outputs.tag }}"
+                  git push origin "${{ steps.version.outputs.tag }}"
+
+            # The release notes are the message of the release commit.
+            - name: Create GitHub release
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  git log -1 --format=%B > "$RUNNER_TEMP/notes.md"
+                  gh release create "${{ steps.version.outputs.tag }}" \
+                    --repo "$GITHUB_REPOSITORY" \
+                    --title "dmezhnov.github.io ${{ steps.version.outputs.version }}" \
+                    --notes-file "$RUNNER_TEMP/notes.md"

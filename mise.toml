@@ -1,0 +1,54 @@
+[tools]
+bun = "1.4.4"
+
+[tasks.test]
+description = "Run all tests of the site"
+dir = "{{config_root}}"
+shell = "bun -e"
+run = '''
+await Bun.$`bun test scripts`;
+'''
+
+[tasks.publish]
+description = "Set VERSION, commit everything, push to test and stream the CI run (mise test -> fast-forward main -> tag v<version> -> GitHub release), then fetch origin"
+dir = "{{config_root}}"
+usage = '''
+arg "<version>" help="New version for the VERSION file, e.g. 0.2.0; the release tag is v<version>"
+arg "<message>" help="Commit message for the release commit; it also becomes the release notes"
+'''
+shell = "bun -e"
+run = '''
+const version = Bun.env.usage_version ?? "", message = Bun.env.usage_message ?? "";
+if (!/^\d+\.\d+\.\d+$/.test(version)) throw new Error(`version must look like 0.2.0, got "${version}"`);
+if (!message.trim()) throw new Error("the commit message is empty");
+const tags = await Bun.$`git ls-remote --tags origin refs/tags/v${version}`.quiet().nothrow();
+if (tags.exitCode !== 0) throw new Error(`git ls-remote failed: ${tags.stderr.toString().trim()}`);
+if (tags.text().trim()) throw new Error(`tag v${version} already exists on origin; pick a new version`);
+// The same checks CI runs: a failure here costs seconds, not a CI round trip.
+const test = await Bun.$`mise test`.nothrow();
+if (test.exitCode !== 0) throw new Error(`mise test failed (exit ${test.exitCode}); nothing was committed`);
+
+await Bun.write("VERSION", version + "\n");
+for (const step of [Bun.$`git add -A`, Bun.$`git commit -q -m ${message}`, Bun.$`git push -q origin HEAD:test --force-with-lease`]) {
+  const out = await step.quiet().nothrow();
+  if (out.exitCode !== 0) throw new Error(`git failed (exit ${out.exitCode}): ${out.stderr.toString().trim()}`);
+}
+
+// Match the run by the pushed SHA, not "latest"; it takes a few seconds to register.
+const sha = (await Bun.$`git rev-parse HEAD`.text()).trim();
+let runId = "";
+for (let i = 0; i < 10 && !runId; i++) {
+  await Bun.sleep(3000);
+  const runs = await Bun.$`gh run list --branch test --limit 10 --json databaseId,headSha`.quiet().nothrow();
+  if (runs.exitCode !== 0) throw new Error(`gh run list failed: ${runs.stderr.toString().trim()}`);
+  runId = String(runs.json().find((r: { headSha: string }) => r.headSha === sha)?.databaseId ?? "");
+}
+if (!runId) throw new Error(`no Publish run for ${sha} after 30 s; check GitHub Actions: gh run list --branch test`);
+const watch = await Bun.$`gh run watch ${runId} --exit-status`.nothrow();
+if (watch.exitCode !== 0) throw new Error(`Publish run ${runId} failed; main is untouched: gh run view ${runId} --log-failed`);
+
+// CI fast-forwarded main on the remote; refresh origin/main so local main no longer shows "ahead 1".
+const fetch = await Bun.$`git fetch -q origin`.quiet().nothrow();
+if (fetch.exitCode !== 0) throw new Error(`git fetch failed: ${fetch.stderr.toString().trim()}`);
+console.log(`released v${version}`);
+'''
